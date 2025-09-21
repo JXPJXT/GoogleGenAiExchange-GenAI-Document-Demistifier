@@ -179,12 +179,25 @@ function PureMultimodalInput({
 
       if (response.ok) {
         const data = await response.json();
-        const { url, pathname, contentType } = data;
+        const { url, pathname, contentType, analysis, riskScore } = data;
+
+        // If this is a legal document with analysis, show success but don't auto-send
+        if (analysis && (contentType === 'application/pdf' || contentType === 'text/plain')) {
+          // Show a success message
+          toast.success(`Document analyzed! Risk Score: ${riskScore}/10. Ask me about the document.`);
+          
+          // Set a placeholder that encourages the user to ask about the document
+          if (input.trim() === '') {
+            setInput(`What should I know about this document?`);
+          }
+        }
 
         return {
           url,
           name: pathname,
           contentType: contentType,
+          analysis: analysis,
+          riskScore: riskScore,
         };
       }
       const { error } = await response.json();

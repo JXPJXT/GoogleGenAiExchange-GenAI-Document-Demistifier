@@ -9,13 +9,12 @@ export interface ChatModel {
 export const chatModels: Array<ChatModel> = [
   {
     id: 'chat-model',
-    name: 'Grok Vision',
-    description: 'Advanced multimodal model with vision and text capabilities',
+    name: 'LegalLens AI',
+    description: 'Specialized local AI model for legal document analysis and chat',
   },
   {
     id: 'chat-model-reasoning',
-    name: 'Grok Reasoning',
-    description:
-      'Uses advanced chain-of-thought reasoning for complex problems',
+    name: 'LegalLens Reasoning',
+    description: 'Advanced local AI with enhanced reasoning for complex legal matters',
   },
 ];

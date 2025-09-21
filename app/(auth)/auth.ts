@@ -1,7 +1,7 @@
 import { compare } from 'bcrypt-ts';
 import NextAuth, { type DefaultSession } from 'next-auth';
 import Credentials from 'next-auth/providers/credentials';
-import { createGuestUser, getUser } from '@/lib/db/queries';
+import { createGuestUser, getUser, getUserById } from '@/lib/db/queries';
 import { authConfig } from './auth.config';
 import { DUMMY_PASSWORD } from '@/lib/constants';
 import type { DefaultJWT } from 'next-auth/jwt';
@@ -76,6 +76,18 @@ export const {
       if (user) {
         token.id = user.id as string;
         token.type = user.type;
+      } else if (token.id) {
+        // Verify that the user still exists in the database on subsequent requests
+        const existingUser = await getUserById(token.id);
+        
+        if (!existingUser) {
+          console.warn('JWT contains non-existent user ID:', token.id, 'Creating new guest user');
+          // Create a new guest user since the token user doesn't exist
+          const [newGuestUser] = await createGuestUser();
+          token.id = newGuestUser.id;
+          token.type = 'guest';
+          console.log('Updated JWT with new guest user:', newGuestUser.id);
+        }
       }
 
       return token;

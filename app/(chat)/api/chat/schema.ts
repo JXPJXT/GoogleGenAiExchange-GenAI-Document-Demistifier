@@ -7,9 +7,16 @@ const textPartSchema = z.object({
 
 const filePartSchema = z.object({
   type: z.enum(['file']),
-  mediaType: z.enum(['image/jpeg', 'image/png']),
+  mediaType: z.enum([
+    'image/jpeg', 
+    'image/png', 
+    'image/gif', 
+    'image/webp',
+    'application/pdf',
+    'text/plain'
+  ]),
   name: z.string().min(1).max(100),
-  url: z.string().url(),
+  url: z.string().min(1), // Accept any non-empty string (relative or absolute URLs)
 });
 
 const partSchema = z.union([textPartSchema, filePartSchema]);
@@ -18,7 +25,7 @@ export const postRequestBodySchema = z.object({
   id: z.string().uuid(),
   message: z.object({
     id: z.string().uuid(),
-    role: z.enum(['user']),
+    role: z.enum(['user', 'assistant']),
     parts: z.array(partSchema),
   }),
   selectedChatModel: z.enum(['chat-model', 'chat-model-reasoning']),

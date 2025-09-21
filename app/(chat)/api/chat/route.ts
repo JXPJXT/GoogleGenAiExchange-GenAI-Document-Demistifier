@@ -24,8 +24,11 @@ import { createDocument } from '@/lib/ai/tools/create-document';
 import { updateDocument } from '@/lib/ai/tools/update-document';
 import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
 import { getWeather } from '@/lib/ai/tools/get-weather';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
 import { isProductionEnvironment } from '@/lib/constants';
 import { myProvider } from '@/lib/ai/providers';
+import { localAIProvider } from '@/lib/ai/local-provider';
 import { entitlementsByUserType } from '@/lib/ai/entitlements';
 import { postRequestBodySchema, type PostRequestBody } from './schema';
 import { geolocation } from '@vercel/functions';
@@ -48,6 +51,82 @@ export const maxDuration = 60;
 
 let globalStreamContext: ResumableStreamContext | null = null;
 
+// Helper function to convert file parts to base64 for Local AI processing
+async function processFilePartsForAI(messages: any[]) {
+  const processedMessages = [];
+  
+  for (const message of messages) {
+    const processedMessage = { ...message };
+    
+    if (message.parts && Array.isArray(message.parts)) {
+      const processedParts = [];
+      
+      for (const part of message.parts) {
+        if (part.type === 'file' && part.url && part.url.startsWith('/uploads/')) {
+          try {
+            // Read the file from the public directory
+            const filePath = join(process.cwd(), 'public', part.url);
+            console.log(`Reading file from: ${filePath}`);
+            const fileBuffer = await readFile(filePath);
+            
+            // For PDF files, extract text content and add it as context
+            if (part.mediaType === 'application/pdf') {
+              try {
+                // Try to extract text from PDF using local AI server
+                const fileBlob = new File([new Uint8Array(fileBuffer)], part.name, { type: 'application/pdf' });
+                const analysis = await localAIProvider.uploadAndAnalyzePDF(fileBlob);
+                
+                // Add the analysis as a system message context
+                processedParts.push({
+                  type: 'text',
+                  text: `[DOCUMENT ANALYSIS]\nDocument: ${part.name}\nAnalysis: ${analysis.analysis}`
+                });
+              } catch (pdfError) {
+                console.error('PDF text extraction failed:', pdfError);
+                // Fallback to base64 data if text extraction fails
+                const base64Data = fileBuffer.toString('base64');
+                processedParts.push({
+                  type: 'file',
+                  mediaType: part.mediaType,
+                  data: base64Data
+                });
+              }
+            } else if (part.mediaType === 'text/plain') {
+              // For text files, include the content directly
+              const textContent = fileBuffer.toString('utf-8');
+              processedParts.push({
+                type: 'text',
+                text: `[DOCUMENT CONTENT]\nDocument: ${part.name}\nContent: ${textContent}`
+              });
+            } else {
+              // For images and other files, use base64 data
+              const base64Data = fileBuffer.toString('base64');
+              processedParts.push({
+                type: 'file',
+                mediaType: part.mediaType,
+                data: base64Data
+              });
+            }
+          } catch (error) {
+            console.error(`Failed to read file ${part.url}:`, error);
+            // If we can't read the file, skip this part
+            continue;
+          }
+        } else {
+          // Keep non-file parts as is
+          processedParts.push(part);
+        }
+      }
+      
+      processedMessage.parts = processedParts;
+    }
+    
+    processedMessages.push(processedMessage);
+  }
+  
+  return processedMessages;
+}
+
 const getTokenlensCatalog = cache(
   async (): Promise<ModelCatalog | undefined> => {
     try {
@@ -67,17 +146,24 @@ const getTokenlensCatalog = cache(
 export function getStreamContext() {
   if (!globalStreamContext) {
     try {
+      // Check if Redis URL is properly configured
+      if (!process.env.REDIS_URL || process.env.REDIS_URL === '****' || process.env.REDIS_URL.trim() === '') {
+        console.log(' > Resumable streams are disabled - REDIS_URL not configured for development');
+        return null;
+      }
+      
       globalStreamContext = createResumableStreamContext({
         waitUntil: after,
       });
     } catch (error: any) {
-      if (error.message.includes('REDIS_URL')) {
+      if (error.message.includes('REDIS_URL') || error.message.includes('Invalid URL')) {
         console.log(
-          ' > Resumable streams are disabled due to missing REDIS_URL',
+          ' > Resumable streams are disabled due to invalid REDIS_URL configuration',
         );
       } else {
-        console.error(error);
+        console.error('Stream context error:', error);
       }
+      return null;
     }
   }
 
@@ -89,8 +175,12 @@ export async function POST(request: Request) {
 
   try {
     const json = await request.json();
+    console.log('Received request body:', JSON.stringify(json, null, 2));
     requestBody = postRequestBodySchema.parse(json);
-  } catch (_) {
+    console.log('Request body validation passed');
+  } catch (error) {
+    console.error('Request validation failed:', error);
+    console.error('Error details:', error instanceof Error ? error.message : 'Unknown validation error');
     return new ChatSDKError('bad_request:api').toResponse();
   }
 
@@ -171,6 +261,24 @@ export async function POST(request: Request) {
     const streamId = generateUUID();
     await createStreamId({ streamId, chatId: id });
 
+    // Process file parts to base64 before sending to AI model
+    const processedUIMessages = await processFilePartsForAI(uiMessages);
+    console.log('Original UI Messages:', JSON.stringify(uiMessages, null, 2));
+    console.log('Processed messages for AI:', JSON.stringify(processedUIMessages, null, 2));
+    
+    // Try to convert and see what happens
+    try {
+      const modelMessages = convertToModelMessages(processedUIMessages);
+      console.log('Successfully converted to ModelMessages:', JSON.stringify(modelMessages, null, 2));
+    } catch (conversionError) {
+      console.error('convertToModelMessages failed:', conversionError);
+      console.error('Processed messages structure:', JSON.stringify(processedUIMessages.map(m => ({
+        role: m.role,
+        parts: Array.isArray(m.parts) ? m.parts.map((p: any) => ({ type: p.type, hasData: !!p.data })) : 'no parts'
+      })), null, 2));
+      throw conversionError;
+    }
+
     let finalMergedUsage: AppUsage | undefined;
 
     const stream = createUIMessageStream({
@@ -178,7 +286,7 @@ export async function POST(request: Request) {
         const result = streamText({
           model: myProvider.languageModel(selectedChatModel),
           system: systemPrompt({ selectedChatModel, requestHints }),
-          messages: convertToModelMessages(uiMessages),
+          messages: convertToModelMessages(processedUIMessages),
           stopWhen: stepCountIs(5),
           experimental_activeTools:
             selectedChatModel === 'chat-model-reasoning'

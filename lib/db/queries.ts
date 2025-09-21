@@ -39,18 +39,48 @@ import type { AppUsage } from '../usage';
 // use the Drizzle adapter for Auth.js / NextAuth
 // https://authjs.dev/reference/adapter/drizzle
 
+// Check if POSTGRES_URL is configured properly
+const isDatabaseConfigured = process.env.POSTGRES_URL && 
+  process.env.POSTGRES_URL !== '****' && 
+  !process.env.POSTGRES_URL.includes('postgresql://temp:temp@localhost') &&
+  !process.env.POSTGRES_URL.includes('abcd12345') &&
+  !process.env.POSTGRES_URL.includes('YOUR_REAL_PASSWORD_HERE');
+
+if (!isDatabaseConfigured) {
+  console.warn('POSTGRES_URL not configured properly. Database operations will be disabled.');
+}
+
+// Use a fallback connection that won't crash
+const connectionString = isDatabaseConfigured 
+  ? process.env.POSTGRES_URL!
+  : 'postgresql://postgres:password@localhost:5432/fallback_db';
+
 // biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
+const client = postgres(connectionString, { 
+  max: 1,
+  idle_timeout: 20,
+  connect_timeout: 10,
+  prepare: false,
+});
 const db = drizzle(client);
 
 export async function getUser(email: string): Promise<Array<User>> {
   try {
     return await db.select().from(user).where(eq(user.email, email));
   } catch (error) {
-    throw new ChatSDKError(
-      'bad_request:database',
-      'Failed to get user by email',
-    );
+    // Return empty array if database operation fails
+    console.warn('Database query failed, returning empty result');
+    return [];
+  }
+}
+
+export async function getUserById(id: string): Promise<User | null> {
+  try {
+    const users = await db.select().from(user).where(eq(user.id, id)).limit(1);
+    return users[0] || null;
+  } catch (error) {
+    console.warn('Database query failed for getUserById:', error);
+    return null;
   }
 }
 
@@ -68,16 +98,25 @@ export async function createGuestUser() {
   const email = `guest-${Date.now()}`;
   const password = generateHashedPassword(generateUUID());
 
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, creating mock guest user');
+    return [{
+      id: generateUUID(),
+      email: email,
+    }];
+  }
+
   try {
-    return await db.insert(user).values({ email, password }).returning({
+    console.log('Creating guest user with email:', email);
+    const result = await db.insert(user).values({ email, password }).returning({
       id: user.id,
       email: user.email,
     });
+    console.log('Guest user created successfully:', result);
+    return result;
   } catch (error) {
-    throw new ChatSDKError(
-      'bad_request:database',
-      'Failed to create guest user',
-    );
+    console.error('Failed to create guest user:', error);
+    throw new ChatSDKError('bad_request:database', 'Failed to create guest user');
   }
 }
 
@@ -92,15 +131,41 @@ export async function saveChat({
   title: string;
   visibility: VisibilityType;
 }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, skipping chat save');
+    return { success: false, reason: 'database_not_configured' };
+  }
+  
   try {
-    return await db.insert(chat).values({
+    console.log('Attempting to save chat with details:', { id, userId, title, visibility });
+    
+    // Ensure user exists before saving chat
+    const existingUser = await getUserById(userId);
+    console.log('User lookup result:', existingUser ? 'Found user' : 'User not found', userId);
+    
+    if (!existingUser) {
+      console.warn('User not found, creating new guest user for chat');
+      const [newGuestUser] = await createGuestUser();
+      // Use the new user ID for the chat
+      userId = newGuestUser.id;
+      console.log('Created new guest user for chat with ID:', userId);
+    }
+    
+    console.log('Inserting chat with final userId:', userId);
+    const result = await db.insert(chat).values({
       id,
       createdAt: new Date(),
       userId,
       title,
       visibility,
     });
+    
+    console.log('Chat saved successfully');
+    return result;
   } catch (error) {
+    console.error('Failed to save chat - detailed error:', error);
+    console.error('Error type:', typeof error);
+    console.error('Error message:', error instanceof Error ? error.message : 'Unknown error');
     throw new ChatSDKError('bad_request:database', 'Failed to save chat');
   }
 }
@@ -135,6 +200,11 @@ export async function getChatsByUserId({
   startingAfter: string | null;
   endingBefore: string | null;
 }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, returning empty chats array');
+    return { chats: [], hasMore: false };
+  }
+  
   try {
     const extendedLimit = limit + 1;
 
@@ -193,6 +263,7 @@ export async function getChatsByUserId({
       hasMore,
     };
   } catch (error) {
+    console.error('Failed to get chats by user id:', error);
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get chats by user id',
@@ -201,6 +272,11 @@ export async function getChatsByUserId({
 }
 
 export async function getChatById({ id }: { id: string }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, returning null for getChatById');
+    return null;
+  }
+  
   try {
     const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
     if (!selectedChat) {
@@ -209,6 +285,7 @@ export async function getChatById({ id }: { id: string }) {
 
     return selectedChat;
   } catch (error) {
+    console.error('Failed to get chat by id:', error);
     throw new ChatSDKError('bad_request:database', 'Failed to get chat by id');
   }
 }
@@ -218,14 +295,25 @@ export async function saveMessages({
 }: {
   messages: Array<DBMessage>;
 }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, skipping message save');
+    return { success: false, reason: 'database_not_configured' };
+  }
+  
   try {
     return await db.insert(message).values(messages);
   } catch (error) {
+    console.error('Failed to save messages:', error);
     throw new ChatSDKError('bad_request:database', 'Failed to save messages');
   }
 }
 
 export async function getMessagesByChatId({ id }: { id: string }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, returning empty messages array');
+    return [];
+  }
+  
   try {
     return await db
       .select()
@@ -233,6 +321,7 @@ export async function getMessagesByChatId({ id }: { id: string }) {
       .where(eq(message.chatId, id))
       .orderBy(asc(message.createdAt));
   } catch (error) {
+    console.error('Failed to get messages by chat id:', error);
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get messages by chat id',
@@ -500,6 +589,11 @@ export async function getMessageCountByUserId({
   id: string;
   differenceInHours: number;
 }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, returning 0 for message count');
+    return 0;
+  }
+  
   try {
     const twentyFourHoursAgo = new Date(
       Date.now() - differenceInHours * 60 * 60 * 1000,
@@ -520,6 +614,7 @@ export async function getMessageCountByUserId({
 
     return stats?.count ?? 0;
   } catch (error) {
+    console.error('Failed to get message count by user id:', error);
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to get message count by user id',
@@ -534,11 +629,17 @@ export async function createStreamId({
   streamId: string;
   chatId: string;
 }) {
+  if (!isDatabaseConfigured) {
+    console.warn('Database not configured, skipping stream creation');
+    return { success: false, reason: 'database_not_configured' };
+  }
+  
   try {
     await db
       .insert(stream)
       .values({ id: streamId, chatId, createdAt: new Date() });
   } catch (error) {
+    console.error('Failed to create stream id:', error);
     throw new ChatSDKError(
       'bad_request:database',
       'Failed to create stream id',
